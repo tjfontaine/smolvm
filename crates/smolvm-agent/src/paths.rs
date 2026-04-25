@@ -27,7 +27,17 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // =============================================================================
 
 /// Root directory for virtiofs mounts from the host.
-pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+///
+/// Sits under `/storage/` (the ext4 storage disk) rather than `/mnt/` so
+/// that `mkdir` on the staging path never has to traverse the overlay's
+/// lowerdir. On the macOS launch path the rootfs is itself served via
+/// virtiofs, which makes `/mnt/*` part of the lowerdir; an mkdir there
+/// forces overlayfs to copy the parent up through the virtiofs daemon and
+/// can fail with `ENETRESET` (errno 102), surfacing as
+/// `agent operation failed: run command: Connection reset by network`.
+/// Keeping the tree on the writable ext4 disk avoids the copy-up
+/// entirely.
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/storage/virtiofs";
 
 // =============================================================================
 // Storage Paths
