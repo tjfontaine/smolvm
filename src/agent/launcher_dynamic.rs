@@ -455,6 +455,21 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
+    // Extra vsock ports requested by an external runner via
+    // SMOLVM_VSOCK_PORT_COUNT / SMOLVM_VSOCK_PORT_<N>. See
+    // `super::launcher::extra_vsock_ports_from_env` for the contract.
+    for (port, host_path) in super::launcher::extra_vsock_ports_from_env() {
+        let path_c = try_or_free_ctx!(
+            path_to_cstring(std::path::Path::new(&host_path)),
+            "extra vsock port path contains null byte"
+        );
+        if unsafe { (krun.add_vsock_port2)(ctx, port, path_c.as_ptr(), false) } < 0 {
+            tracing::warn!(port, host_path = %host_path, "failed to add extra vsock port");
+        } else {
+            tracing::info!(port, host_path = %host_path, "extra vsock port enabled");
+        }
+    }
+
     // Redirect console output to a log file so libkrun doesn't put the
     // inherited terminal into raw mode (which would break terminal echo
     // if the child is killed before exit observers can restore it).

@@ -4,7 +4,10 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::consts::{
+    ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_SMOLVM_VSOCK_PORT_COUNT,
+    ENV_SMOLVM_VSOCK_PORT_PREFIX,
+};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
@@ -529,6 +532,31 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Extra vsock ports requested by an external runner.
+        //
+        // Contract:
+        //   SMOLVM_VSOCK_PORT_COUNT=N
+        //   SMOLVM_VSOCK_PORT_0=<vsock_port>:<host_unix_socket_path>
+        //   SMOLVM_VSOCK_PORT_1=...
+        //
+        // Each port is registered with libkrun as listen=false: the guest
+        // dials the vsock port, libkrun forwards the stream to the host
+        // Unix socket. This mirrors how SMOLVM_MOUNT_* is plumbed, and
+        // covers callers that wrap `smolvm machine start` to bridge a
+        // host-side service into the guest without patching smolvm.
+        for (port, host_path) in extra_vsock_ports_from_env() {
+            let path_c = try_or_free_ctx!(
+                path_to_cstring(std::path::Path::new(&host_path)),
+                "add extra vsock port",
+                "path contains null byte"
+            );
+            if krun_add_vsock_port2(ctx, port, path_c.as_ptr(), false) < 0 {
+                tracing::warn!(port, host_path = %host_path, "failed to add extra vsock port");
+            } else {
+                tracing::info!(port, host_path = %host_path, "extra vsock port enabled");
+            }
+        }
+
         // Set console output if specified
         if let Some(log_path) = console_log {
             let console_path = try_or_free_ctx!(
@@ -711,6 +739,77 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
 }
 
+/// Parse `SMOLVM_VSOCK_PORT_*` env entries and yield `(port, host_path)`
+/// pairs ready for `krun_add_vsock_port2(.., listen=false)`.
+///
+/// `get_env` is the environment lookup; production callers pass
+/// `|name| std::env::var(name).ok()`. Tests pass a closure backed by a map
+/// to avoid touching the process environment.
+///
+/// Contract:
+///   `SMOLVM_VSOCK_PORT_COUNT=N`
+///   `SMOLVM_VSOCK_PORT_0=<port>:<host_unix_socket_path>`
+///
+/// Malformed entries are logged and skipped; they don't abort the launch.
+/// Reserved smolvm control ports (`AGENT_CONTROL`, `SSH_AGENT`, `DNS_FILTER`)
+/// are rejected so external runners can't clobber them.
+fn parse_extra_vsock_ports<F>(get_env: F) -> Vec<(u32, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let count: usize = match get_env(ENV_SMOLVM_VSOCK_PORT_COUNT).and_then(|v| v.parse().ok()) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let key = format!("{}{}", ENV_SMOLVM_VSOCK_PORT_PREFIX, i);
+        let raw = match get_env(&key) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(key = %key, "missing extra vsock port env var");
+                continue;
+            }
+        };
+        let (port_str, host_path) = match raw.split_once(':') {
+            Some((p, path)) if !path.is_empty() => (p, path.to_string()),
+            _ => {
+                tracing::warn!(
+                    key = %key,
+                    value = %raw,
+                    "invalid format, expected '<port>:<path>'"
+                );
+                continue;
+            }
+        };
+        let port: u32 = match port_str.parse() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(key = %key, value = %raw, "invalid port number");
+                continue;
+            }
+        };
+        if port == ports::AGENT_CONTROL || port == ports::SSH_AGENT || port == ports::DNS_FILTER {
+            tracing::warn!(
+                key = %key,
+                port,
+                "extra vsock port collides with reserved smolvm port; skipping"
+            );
+            continue;
+        }
+        out.push((port, host_path));
+    }
+    out
+}
+
+/// Read `SMOLVM_VSOCK_PORT_*` from the process environment.
+///
+/// See [`parse_extra_vsock_ports`] for the contract.
+pub(crate) fn extra_vsock_ports_from_env() -> Vec<(u32, String)> {
+    parse_extra_vsock_ports(|name| std::env::var(name).ok())
+}
+
 type AddNetUnixstreamFn =
     unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32;
 
@@ -765,5 +864,125 @@ fn raise_fd_limits() {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_unset_returns_empty() {
+        let ports = parse_extra_vsock_ports(env(&[]));
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_zero_count_returns_empty() {
+        let ports = parse_extra_vsock_ports(env(&[(ENV_SMOLVM_VSOCK_PORT_COUNT, "0")]));
+        assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_single_entry() {
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "1"),
+            ("SMOLVM_VSOCK_PORT_0", "6600:/tmp/sock"),
+        ]));
+        assert_eq!(ports, vec![(6600u32, "/tmp/sock".to_string())]);
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_multiple_entries() {
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "2"),
+            ("SMOLVM_VSOCK_PORT_0", "6600:/tmp/a"),
+            ("SMOLVM_VSOCK_PORT_1", "6601:/tmp/b"),
+        ]));
+        assert_eq!(
+            ports,
+            vec![
+                (6600u32, "/tmp/a".to_string()),
+                (6601u32, "/tmp/b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_path_with_colon() {
+        // split_once(':') keeps everything after the first ':' as the path.
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "1"),
+            ("SMOLVM_VSOCK_PORT_0", "6600:/var/run/path:with:colons"),
+        ]));
+        assert_eq!(
+            ports,
+            vec![(6600u32, "/var/run/path:with:colons".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_skips_missing_entries() {
+        // SMOLVM_VSOCK_PORT_1 is missing; SMOLVM_VSOCK_PORT_2 still gets read.
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "3"),
+            ("SMOLVM_VSOCK_PORT_0", "6600:/tmp/a"),
+            ("SMOLVM_VSOCK_PORT_2", "6602:/tmp/c"),
+        ]));
+        assert_eq!(
+            ports,
+            vec![
+                (6600u32, "/tmp/a".to_string()),
+                (6602u32, "/tmp/c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_skips_malformed() {
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "4"),
+            ("SMOLVM_VSOCK_PORT_0", "no-colon"),
+            ("SMOLVM_VSOCK_PORT_1", "6600:"), // empty path
+            ("SMOLVM_VSOCK_PORT_2", "notanumber:/tmp/x"),
+            ("SMOLVM_VSOCK_PORT_3", "6603:/tmp/d"),
+        ]));
+        assert_eq!(ports, vec![(6603u32, "/tmp/d".to_string())]);
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_rejects_reserved() {
+        let ports = parse_extra_vsock_ports(env(&[
+            (ENV_SMOLVM_VSOCK_PORT_COUNT, "4"),
+            (
+                "SMOLVM_VSOCK_PORT_0",
+                &format!("{}:/tmp/a", ports::AGENT_CONTROL),
+            ),
+            (
+                "SMOLVM_VSOCK_PORT_1",
+                &format!("{}:/tmp/b", ports::SSH_AGENT),
+            ),
+            (
+                "SMOLVM_VSOCK_PORT_2",
+                &format!("{}:/tmp/c", ports::DNS_FILTER),
+            ),
+            ("SMOLVM_VSOCK_PORT_3", "6603:/tmp/d"),
+        ]));
+        assert_eq!(ports, vec![(6603u32, "/tmp/d".to_string())]);
+    }
+
+    #[test]
+    fn parse_extra_vsock_ports_invalid_count_returns_empty() {
+        let ports = parse_extra_vsock_ports(env(&[(ENV_SMOLVM_VSOCK_PORT_COUNT, "not-a-number")]));
+        assert!(ports.is_empty());
     }
 }
