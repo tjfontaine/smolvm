@@ -1095,6 +1095,7 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             extra_disks: features.extra_disks,
+            vhost_user_device_sockets: features.vhost_user_device_sockets,
         };
         let config_path = self
             .storage_disk

@@ -55,4 +55,13 @@ pub struct BootConfig {
     /// Additional disk images to attach (path, read_only).
     #[serde(default)]
     pub extra_disks: Vec<(PathBuf, bool)>,
+    /// vhost-user-device socket paths. When non-empty, the
+    /// `_boot-vm` subprocess sets `LIBKRUN_VHOST_USER_DEVICE_SOCKET`
+    /// in its own environment before invoking libkrun, so the
+    /// host-side vhost-user frontend can connect to an
+    /// out-of-process backend daemon. The env var is set only
+    /// inside the subprocess that actually runs the VM; the
+    /// smolvm CLI process never sees it.
+    #[serde(default)]
+    pub vhost_user_device_sockets: Vec<PathBuf>,
 }

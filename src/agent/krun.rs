@@ -44,6 +44,13 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Attach a vhost-user device by socket path. Optional —
+    /// only present in libkrun builds with the `vhost-user`
+    /// Cargo feature. Callers should treat `None` as "build
+    /// does not support vhost-user; ignore any
+    /// --vhost-user-device flags".
+    pub add_vhost_user_device:
+        Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
 }
 
 impl KrunFunctions {
@@ -133,6 +140,7 @@ impl KrunFunctions {
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
             set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
+            add_vhost_user_device: load_optional_sym!("krun_add_vhost_user_device"),
         })
     }
 }

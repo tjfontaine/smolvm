@@ -107,6 +107,13 @@ pub struct LaunchFeatures {
     /// Additional disk images to attach to the VM (path, read_only).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool)>,
+    /// vhost-user-device socket paths. When non-empty, the
+    /// `_boot-vm` subprocess sets `LIBKRUN_VHOST_USER_DEVICE_SOCKET`
+    /// before invoking libkrun so the host-side vhost-user
+    /// frontend connects to an out-of-process backend daemon.
+    /// Smolvm does not know what device type the backend
+    /// exposes — that is libkrun's vhost-user frontend's concern.
+    pub vhost_user_device_sockets: Vec<std::path::PathBuf>,
 }
 
 /// Configuration for launching an agent VM.
@@ -144,6 +151,13 @@ pub struct LaunchConfig<'a> {
     /// libkrun. This keeps the egress allow-list accurate for long-running VMs
     /// hitting CDN-backed hosts whose IPs rotate.
     pub egress_refresh_hosts: Option<Vec<String>>,
+    /// vhost-user-device socket paths. Each socket is announced
+    /// to libkrun via `krun_add_vhost_user_device` (if the loaded
+    /// libkrun.dylib exports it). Smolvm does not know what
+    /// device type the backend exposes — that is libkrun's
+    /// vhost-user frontend's concern. Multiple sockets accumulate
+    /// in libkrun's internal list.
+    pub vhost_user_device_sockets: &'a [std::path::PathBuf],
 }
 
 /// Launch the agent VM using libkrun.
@@ -164,6 +178,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         extra_disks,
         dns_filter_enabled,
         egress_refresh_hosts,
+        vhost_user_device_sockets,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -277,6 +292,42 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
+        }
+
+        // Attach any caller-supplied vhost-user devices. The
+        // libkrun.dylib must export `krun_add_vhost_user_device`
+        // (built with the `vhost-user` Cargo feature) AND smolvm
+        // must have been asked to attach at least one socket.
+        // The C ABI fn returns -ENOSYS on libkrun builds without
+        // the feature; we surface a clear error so the operator
+        // knows their libkrun.dylib is missing the feature.
+        if !vhost_user_device_sockets.is_empty() {
+            let add_fn = match krun.add_vhost_user_device {
+                Some(f) => f,
+                None => {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "attach vhost-user device",
+                        "libkrun.dylib does not export krun_add_vhost_user_device \
+                         (rebuild libkrun with --features vhost-user)",
+                    ));
+                }
+            };
+            for sock in vhost_user_device_sockets.iter() {
+                let c_path = try_or_free_ctx!(
+                    path_to_cstring(sock),
+                    "attach vhost-user device",
+                    "socket path contains null byte"
+                );
+                let rc = add_fn(ctx, c_path.as_ptr());
+                if rc < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "attach vhost-user device",
+                        format!("krun_add_vhost_user_device({}) = {rc}", sock.display()),
+                    ));
+                }
+            }
         }
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());

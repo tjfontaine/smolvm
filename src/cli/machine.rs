@@ -287,6 +287,19 @@ pub struct RunCmd {
     #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB", help_heading = "Resources")]
     pub mem: u32,
 
+    /// Attach a vhost-user device by socket path. The VM will
+    /// connect to the named UNIX socket as a vhost-user frontend.
+    /// What kind of device this exposes is decided by libkrun's
+    /// vhost-user frontend support (currently: device type 42).
+    /// Can be repeated. Requires the libkrun.dylib to be built
+    /// with the `vhost-user` feature.
+    #[arg(
+        long = "vhost-user-device",
+        value_name = "SOCKET",
+        help_heading = "Devices"
+    )]
+    pub vhost_user_device: Vec<PathBuf>,
+
     /// Storage disk size in GiB
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub storage: Option<u64>,
@@ -456,6 +469,7 @@ impl RunCmd {
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir: None,
             extra_disks: Vec::new(),
+            vhost_user_device_sockets: self.vhost_user_device.clone(),
         };
 
         let freshly_started = manager
